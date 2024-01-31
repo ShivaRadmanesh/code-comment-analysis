@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "msr"
+version = "0.1.0"
+description = "code/comment dependecy check"
+authors = ["Shiva Radmanesh"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+openai = "^1.3.5"
+tqdm = "^4.66.1"
+backoff = "^2.2.1"
+jsonlines = "^4.0.0"
+pydantic = "^2.5.2"
+
+[tool.poetry.group.dev.dependencies]
+pandas = "^2.1.3"
+ipykernel = "^6.27.1"
+ipython = "^8.18.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,6 +1,8 @@
-from os import path, rename, remove
+from enum import Enum
+from os import path, rename, remove, mkdir, listdir
+from shutil import rmtree
 import json
-from typing import Literal
+from typing import Callable, Literal
 from openai.types.chat.chat_completion import ChatCompletion
 import pickle as pkl
 import jsonlines
@@ -41,7 +43,9 @@ RepoName = Literal[
     'tomcat',
     'tomee',
     'usergrid',
-    'wicket'
+    'wicket',
+    'gt',
+    'vgt'
 ]
 
 DATA_PATH = "data/"
@@ -90,11 +94,12 @@ class Record(BaseModel):
     commit_pair: CommitPair
 
     gpt_response: GptResponse | None = None
-    prompt: str | None = None
+    prompt: str | None | list = None
     attempts: int = 0
+    ocd_label: int | None = None
 
     class Filter:
-        def __init__(self, data: list['Record'], filter: Literal['no_response'] | None = None, partial_save: int = 10):
+        def __init__(self, data: list['Record'], filter: Literal['no_response'] | None = None, partial_save: int = 10, partial_reports: int = 0, report_clb: Callable | None = None):
             self.data = data
             if filter == 'no_response':
                 self.filtered_indices = [i for i, r in enumerate(
@@ -103,18 +108,30 @@ class Record(BaseModel):
                 self.filtered_indices = range(len(data))
 
             self.iter = iter(self.filtered_indices)
-            self.count = -1
             self.partial_save = partial_save
+            self.to_save = []
+            self.send_reports = partial_reports
+            self.count = 0
+            self.report_clb = report_clb
 
         def __iter__(self):
             return self
 
         def __next__(self):
             i = next(self.iter)
-            if self.count % self.partial_save == 0:
+
+            if len(self.to_save) >= self.partial_save:
                 print("Saving partial result")
-                save_records(self.data, partial=True)
+                save_records(self.to_save, partial=True)
+                self.to_save = []
+            else:
+                self.to_save.append(self.data[i])
+
+            if self.report_clb and self.count % self.send_reports == 0:
+                self.report_clb(self.count, len(self.filtered_indices))
+
             self.count += 1
+
             return self.data[i]
 
         def __len__(self):
@@ -147,10 +164,32 @@ def convert_commit_pair_2_records(cp_name: RepoName, auto_save=True,
 
 def load_records(repo_name: RepoName, auto_create=False, allow_partial=True):
     records_path = path.join(DATA_PATH, OUTPUTS_DIR, f"{repo_name}.pkl")
-    if allow_partial and path.exists(path.join(DATA_PATH, OUTPUTS_DIR, PARTIAL_DIR, f"{repo_name}.pkl")):
+    if allow_partial and path.exists(path.join(DATA_PATH, OUTPUTS_DIR, PARTIAL_DIR, repo_name)):
         print("loading from partial data")
-        records_path = path.join(DATA_PATH, OUTPUTS_DIR,
-                                 PARTIAL_DIR, f"{repo_name}.pkl")
+        print("getting blank data from out dir")
+        records_path = path.join(DATA_PATH, OUTPUTS_DIR, f"{repo_name}.pkl")
+        with open(records_path, 'rb') as fin:
+            records: list[Record] = pkl.load(fin)
+
+        mapping: dict[str, int] = {}
+        for index, r in enumerate(records):
+            mapping[r.commit_pair.id] = index
+
+        print("loaded blank dir")
+        base_path = path.join(DATA_PATH, OUTPUTS_DIR, PARTIAL_DIR, repo_name)
+        partial_segments = [x for x in listdir(base_path) if ".pkl." in x]
+        # We must prioritize the later pkl files over old pkl files.
+        partial_segments = [int(x.split('.')[-1]) for x in partial_segments]
+        partial_segments.sort()
+        partial_segments = [f"{repo_name}.pkl.{x}" for x in partial_segments]
+
+        print("found partial segments", partial_segments)
+        for ps in partial_segments:
+            with open(path.join(base_path, ps), 'rb') as fin:
+                tmp_records: list[Record] = pkl.load(fin)
+            for r in tmp_records:
+                records[mapping[r.commit_pair.id]] = r
+        return records
 
     if not path.exists(records_path) and auto_create:
         records_path = path.join(DATA_PATH, OUTPUTS_DIR, f"{repo_name}.pkl")
@@ -168,13 +207,22 @@ def load_records(repo_name: RepoName, auto_create=False, allow_partial=True):
 def save_records(records: list[Record], repo_name: RepoName | None = None, partial=False, invalidate_partial=False):
     if not repo_name:
         repo_name = records[0].repo
-    partial_path = path.join(DATA_PATH, OUTPUTS_DIR,
-                             PARTIAL_DIR, f"{repo_name}.pkl")
-    
+    partial_dir = path.join(DATA_PATH, OUTPUTS_DIR,
+                            PARTIAL_DIR, repo_name)
+
     record_path = path.join(DATA_PATH, OUTPUTS_DIR, f"{repo_name}.pkl")
-    
+
     if partial:
-        save_path = partial_path
+        save_path = partial_dir
+        if not path.exists(partial_dir):
+            mkdir(partial_dir)
+        count = 0
+        save_path = path.join(save_path, f"{repo_name}.pkl.0")
+        while path.exists(save_path):
+            count += 1
+            save_path = save_path.split(".pkl.")[0]
+            save_path += f".pkl.{count}"
+
     else:
         save_path = record_path
         # Saving full/empty versions
@@ -190,8 +238,15 @@ def save_records(records: list[Record], repo_name: RepoName | None = None, parti
 
     # Remove partial only if save was successfull
     if not partial and invalidate_partial:
-        if invalidate_partial and path.exists(partial_path):
-            remove(partial_path)
+        if invalidate_partial and path.exists(partial_dir):
+            rmtree(partial_dir)
+
+
+class RecordStatus(Enum):
+    PAST_OUTDATED = "past outdated"
+    OUTDATED = "outdated"
+    NORMAL = "normal"
+    UNCATEGORIZED = "uncategorized"
 
 
 @dataclass
@@ -204,6 +259,19 @@ class RecordResult:
 class ParsedRecord:
     record: Record
     result: RecordResult
+
+    @property
+    def status(self) -> RecordStatus:
+        oc = self.record.commit_pair.old_comment
+        nc = self.record.commit_pair.new_comment
+        if oc != nc and self.result.old2new is False and self.result.new2new is False:
+            return RecordStatus.PAST_OUTDATED
+        elif self.result.old2new is True and self.result.new2new is False:
+            return RecordStatus.OUTDATED
+        elif (self.result.old2new is True and self.result.new2new is True) or (self.result.old2new is False and self.result.new2new is True):
+            return RecordStatus.NORMAL
+
+        return RecordStatus.UNCATEGORIZED
 
 
 def print_info(name: str, segment: list[ParsedRecord], separator: str = ""):
@@ -222,3 +290,20 @@ def print_info(name: str, segment: list[ParsedRecord], separator: str = ""):
     print(
         f"| {name:^30} | {count14bi:^10} | {count14nbi:^10} | {count7bi:^10} | {count7nbi:^10} |")
     print(separator)
+
+
+def load_gt_answers(vgt_only=True):
+    if vgt_only:
+        path = "data/verified_test_from_cleaned_shiva.jsonl"
+    else:
+        path = "data/out/total_test_final.jsonl"
+    with open(path, 'r') as fin:
+        data = [json.loads(x) for x in fin.readlines()]
+    answers = {}
+    for d in data:
+        # prefix = "vgt_" if vgt_only else "gt_"
+        answers[d['id']] = bool(d['label'])
+    return answers
+
+
+GptMessage = list
